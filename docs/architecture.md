@@ -67,6 +67,6 @@ The introspection endpoint URL is a foot-gun: if you read it from config or a di
 !!! warning "Not a general-purpose SSRF filter"
     `is_safe_url` does **not** resolve DNS — any `https://` URL with a non-IP hostname is accepted regardless of the address it resolves to. This is intentional for *operator-configured* endpoints, where you control the URL. Do not reuse it to validate untrusted, user-supplied URLs (webhooks, fetch targets); for those you must resolve the hostname and reject private/internal targets yourself (and pin the resolved IP to defend against DNS rebinding). See the function docstring for details.
 
-[`IntrospectionTokenVerifier`][mcp_authflow_resource.IntrospectionTokenVerifier] runs this check on every token verification request: a request against an endpoint with an unsafe URL is rejected (it fails auth and returns no token) rather than being introspected. The check is not performed at construction time, so a misconfigured URL surfaces at the first verification, not at startup.
+[`IntrospectionTokenVerifier`][mcp_authflow_resource.IntrospectionTokenVerifier] runs this check once at construction time. A request against an endpoint with an unsafe URL is rejected (it fails auth and returns no token) rather than being introspected. The verifier also owns a pooled HTTP client; call `await verifier.close()` during application shutdown to release its connections.
 
 [mcp-authflow]: https://github.com/brooksmcmillin/mcp-authflow

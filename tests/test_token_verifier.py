@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from typing import Any
@@ -157,6 +158,80 @@ class TestSSRFGuard:
             await verifier.verify_token("tok")
 
         assert any("unsafe scheme" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Pooled HTTP client tests
+# ---------------------------------------------------------------------------
+
+
+class TestPooledHttpClient:
+    """The verifier owns one client for its full active lifetime."""
+
+    async def test_reuses_one_client_for_uncached_verifications(self) -> None:
+        verifier = _make_verifier()
+        mock_post = AsyncMock(return_value=_mock_http_response(200, _ACTIVE_TOKEN_DATA))
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client_cls.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=mock_post)
+            )
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            assert await verifier.verify_token("first") is not None
+            assert await verifier.verify_token("second") is not None
+
+        mock_client_cls.assert_called_once_with(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            verify=False,
+        )
+        assert mock_post.call_count == 2
+
+    async def test_concurrent_verifications_create_one_client(self) -> None:
+        verifier = _make_verifier()
+        mock_post = AsyncMock(return_value=_mock_http_response(200, _ACTIVE_TOKEN_DATA))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def enter_client() -> MagicMock:
+            entered.set()
+            await release.wait()
+            return MagicMock(post=mock_post)
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client_cls.return_value.__aenter__ = AsyncMock(side_effect=enter_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            first = asyncio.create_task(verifier.verify_token("first"))
+            await entered.wait()
+            second = asyncio.create_task(verifier.verify_token("second"))
+            await asyncio.sleep(0)
+            release.set()
+            assert await first is not None
+            assert await second is not None
+
+        mock_client_cls.assert_called_once()
+
+    async def test_close_releases_the_pooled_client(self) -> None:
+        verifier = _make_verifier()
+        mock_post = AsyncMock(return_value=_mock_http_response(200, _ACTIVE_TOKEN_DATA))
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client_cls.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=mock_post)
+            )
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await verifier.verify_token("token")
+            await verifier.close()
+
+        mock_client_cls.return_value.__aexit__.assert_awaited_once_with(None, None, None)
+
+    def test_endpoint_cannot_change_after_ssrf_validation(self) -> None:
+        verifier = _make_verifier()
+
+        with pytest.raises(AttributeError):
+            object.__setattr__(verifier, "introspection_endpoint", "file:///etc/passwd")
 
 
 # ---------------------------------------------------------------------------

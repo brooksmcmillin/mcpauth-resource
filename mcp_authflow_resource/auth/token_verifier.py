@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Literal
 
+import httpx
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
 
@@ -81,7 +82,7 @@ class IntrospectionTokenVerifier(TokenVerifier):
         introspection_cache_ttl: float = 0.0,
         introspection_cache_max_size: int = _DEFAULT_CACHE_MAX_SIZE,
     ):
-        self.introspection_endpoint = introspection_endpoint
+        self._introspection_endpoint = introspection_endpoint
         self.server_url = server_url
         self.validate_resource = validate_resource
         self.resource_url = resource_url_from_server_url(server_url)
@@ -92,6 +93,17 @@ class IntrospectionTokenVerifier(TokenVerifier):
             if client_secret is None and client_auth_method != "bearer"
             else client_auth_method
         )
+        self._introspection_endpoint_is_safe = is_safe_url(
+            introspection_endpoint, allow_localhost=True
+        )
+        if not self._introspection_endpoint_is_safe:
+            logger.warning(
+                "Rejecting introspection endpoint with unsafe scheme: %s",
+                introspection_endpoint,
+            )
+        self._client: httpx.AsyncClient | None = None
+        self._client_context: httpx.AsyncClient | None = None
+        self._client_lock = asyncio.Lock()
 
         if self._client_auth_method in ("client_secret_basic", "client_secret_post"):
             if self._client_id is None or self._client_secret is None:
@@ -116,6 +128,11 @@ class IntrospectionTokenVerifier(TokenVerifier):
     @property
     def _cache_enabled(self) -> bool:
         return self._cache_ttl > 0
+
+    @property
+    def introspection_endpoint(self) -> str:
+        """The validated, immutable token-introspection endpoint."""
+        return self._introspection_endpoint
 
     @staticmethod
     def _cache_key(token: str) -> str:
@@ -154,6 +171,26 @@ class IntrospectionTokenVerifier(TokenVerifier):
         async with self._cache_lock:
             self._cache.pop(key, None)
 
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Return the verifier-owned client, creating it once on first use."""
+        async with self._client_lock:
+            if self._client is None:
+                self._client_context = httpx.AsyncClient(
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                    verify=self.introspection_endpoint.startswith("https://"),
+                )
+                self._client = await self._client_context.__aenter__()
+            return self._client
+
+    async def close(self) -> None:
+        """Close the pooled HTTP client when the owning application shuts down."""
+        async with self._client_lock:
+            if self._client_context is not None:
+                await self._client_context.__aexit__(None, None, None)
+                self._client = None
+                self._client_context = None
+
     def _apply_client_auth(
         self,
         headers: dict[str, str],
@@ -191,14 +228,7 @@ class IntrospectionTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Verify token via introspection endpoint."""
-        import httpx  # noqa: PLC0415
-
-        # Validate URL to prevent SSRF attacks
-        if not is_safe_url(self.introspection_endpoint, allow_localhost=True):
-            logger.warning(
-                "Rejecting introspection endpoint with unsafe scheme: %s",
-                self.introspection_endpoint,
-            )
+        if not self._introspection_endpoint_is_safe:
             return None
 
         cache_key = self._cache_key(token) if self._cache_enabled else None
@@ -211,61 +241,48 @@ class IntrospectionTokenVerifier(TokenVerifier):
                 logger.debug("Token introspection served from cache")
                 return cached
 
-        # Configure secure HTTP client
-        timeout = httpx.Timeout(10.0, connect=5.0)
-        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
-
-        # Only verify SSL for HTTPS URLs
-        verify_ssl = self.introspection_endpoint.startswith("https://")
-
         headers: dict[str, str] = {"Content-Type": "application/x-www-form-urlencoded"}
         data: dict[str, str] = {"token": token}
         self._apply_client_auth(headers, data)
 
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            limits=limits,
-            verify=verify_ssl,  # Enforce SSL verification for HTTPS only
-        ) as client:
-            try:
-                response = await client.post(
-                    self.introspection_endpoint,
-                    data=data,
-                    headers=headers,
-                )
+        try:
+            client = await self._get_client()
+            response = await client.post(
+                self.introspection_endpoint,
+                data=data,
+                headers=headers,
+            )
 
-                if response.status_code != 200:
-                    logger.debug("Token introspection returned status %s", response.status_code)
-                    return None
-
-                data_resp = response.json()
-                if not data_resp.get("active", False):
-                    logger.debug("Token marked as inactive")
-                    # Authoritative negative — reflect revocation immediately.
-                    if cache_key is not None:
-                        await self._cache_drop(cache_key)
-                    return None
-
-                # RFC 8707 resource validation (enabled by default)
-                if self.validate_resource and not self._validate_resource(data_resp):
-                    logger.warning(
-                        "Token resource validation failed. Expected: %s", self.resource_url
-                    )
-                    return None
-
-                access_token = AccessToken(
-                    token=token,
-                    client_id=data_resp.get("client_id", "unknown"),
-                    scopes=self._parse_scopes(data_resp.get("scope")),
-                    expires_at=data_resp.get("exp"),
-                    resource=data_resp.get("aud"),  # Include resource in token
-                )
-                if cache_key is not None:
-                    await self._cache_put(cache_key, access_token, access_token.expires_at)
-                return access_token
-            except Exception as e:
-                logger.warning("Token introspection failed: %s", e)
+            if response.status_code != 200:
+                logger.debug("Token introspection returned status %s", response.status_code)
                 return None
+
+            data_resp = response.json()
+            if not data_resp.get("active", False):
+                logger.debug("Token marked as inactive")
+                # Authoritative negative — reflect revocation immediately.
+                if cache_key is not None:
+                    await self._cache_drop(cache_key)
+                return None
+
+            # RFC 8707 resource validation (enabled by default)
+            if self.validate_resource and not self._validate_resource(data_resp):
+                logger.warning("Token resource validation failed. Expected: %s", self.resource_url)
+                return None
+
+            access_token = AccessToken(
+                token=token,
+                client_id=data_resp.get("client_id", "unknown"),
+                scopes=self._parse_scopes(data_resp.get("scope")),
+                expires_at=data_resp.get("exp"),
+                resource=data_resp.get("aud"),  # Include resource in token
+            )
+            if cache_key is not None:
+                await self._cache_put(cache_key, access_token, access_token.expires_at)
+            return access_token
+        except Exception as e:
+            logger.warning("Token introspection failed: %s", e)
+            return None
 
     @staticmethod
     def _parse_scopes(raw_scope: Any) -> list[str]:
